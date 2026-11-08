@@ -1,0 +1,29 @@
+# Sample requests. In VS Code, install the "REST Client" extension and click
+# "Send Request" above each one. Start the API first with `dotnet run`.
+
+@host = http://localhost:5080
+
+### Health check
+GET {{host}}/health
+
+### Valid projection
+POST {{host}}/api/projection
+Content-Type: application/json
+
+{
+  "age": 30,
+  "currentBalance": 50000,
+  "annualSalary": 90000,
+  "contributionRatePercent": 12
+}
+
+### Invalid projection (expect 400 with a list of errors)
+POST {{host}}/api/projection
+Content-Type: application/json
+
+{
+  "age": 70,
+  "currentBalance": -1,
+  "annualSalary": 90000,
+  "contributionRatePercent": 60
+}
