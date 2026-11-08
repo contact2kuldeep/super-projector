@@ -1,0 +1,122 @@
+# Infrastructure pipeline: checks and deploys infra/main.bicep to Azure.
+#
+# validate: compile the Bicep and preview the changes (what-if).
+# deploy:   apply the changes, then list the URLs in the job summary.
+#
+# Login uses OIDC: GitHub issues a short-lived token that Azure trusts through a
+# federated credential on our Entra ID app registration, so no Azure password
+# or secret key is stored in GitHub. The three AZURE_* secrets are only IDs.
+
+name: infra
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infra/**'
+      - '.github/workflows/infra.yml'
+  # Adds a "Run workflow" button on the Actions tab. Choose the main branch:
+  # login only works from main (see the note on jobs below).
+  workflow_dispatch:
+
+# The OIDC token needs 'id-token: write'. 'contents: read' lets checkout read
+# the repo. Everything else is denied by default.
+permissions:
+  id-token: write
+  contents: read
+
+# Only one infra run at a time. A new run waits for the current one rather than
+# cancelling it, because stopping a deployment halfway can leave resources in
+# a partly updated state.
+concurrency:
+  group: infra-dev
+  cancel-in-progress: false
+
+# Defined once here and used by every step below.
+env:
+  RESOURCE_GROUP: rg-superprojector-dev
+  TEMPLATE_FILE: infra/main.bicep
+  PARAMETERS_FILE: infra/main.bicepparam
+
+# NOTE: these jobs deliberately have no "environment:" setting.
+# Our Entra ID federated credential trusts tokens whose subject is
+#   repo:<owner>/super-projector:ref:refs/heads/main
+# Adding "environment: dev" changes the subject to
+#   repo:<owner>/super-projector:environment:dev
+# which no longer matches, so Azure login would fail. To use environments
+# later, add a second federated credential for that subject first.
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    # The federated credential only trusts main, so skip cleanly on any other
+    # branch instead of failing at login.
+    if: github.ref == 'refs/heads/main'
+    steps:
+      # Download the repo's files onto the runner.
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      # Swap the GitHub OIDC token for an Azure access token.
+      - name: Log in to Azure (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Compile the Bicep. Fails fast on syntax or type errors.
+      - name: Build Bicep
+        run: az bicep build --file "$TEMPLATE_FILE"
+
+      # Ask Azure what would change, without changing anything. This also runs
+      # Azure's preflight checks (e.g. quota), so most problems show up here,
+      # before the deploy job starts.
+      - name: Preview changes (what-if)
+        run: |
+          az deployment group what-if \
+            --resource-group "$RESOURCE_GROUP" \
+            --parameters "$PARAMETERS_FILE"
+
+  deploy:
+    runs-on: ubuntu-latest
+    # Only runs if validate succeeded.
+    needs: validate
+    steps:
+      # Each job runs on a fresh machine, so check out and log in again.
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Log in to Azure (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Apply the template. Bicep deployments are "incremental": resources in
+      # the template are created or updated, and anything else in the resource
+      # group is left alone. The run number gives each deployment a unique name
+      # in the resource group's deployment history.
+      - name: Deploy Bicep
+        run: |
+          az deployment group create \
+            --name "infra-${{ github.run_number }}" \
+            --resource-group "$RESOURCE_GROUP" \
+            --parameters "$PARAMETERS_FILE" \
+            --query properties.outputs \
+            --output json > outputs.json
+
+      # Turn the template's outputs into a table on the run's Summary page.
+      # jq is preinstalled on GitHub's Ubuntu runners.
+      - name: Write outputs to job summary
+        run: |
+          {
+            echo "## Deployed to \`$RESOURCE_GROUP\`"
+            echo ""
+            echo "| Output | Value |"
+            echo "| --- | --- |"
+            for key in apiUrl webUrl apiAppName staticWebAppName; do
+              echo "| $key | $(jq -r ".$key.value" outputs.json) |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
