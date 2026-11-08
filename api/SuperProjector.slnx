@@ -2,4 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/SuperProjector.Api/SuperProjector.Api.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/SuperProjector.Api.Tests/SuperProjector.Api.Tests.csproj" />
+  </Folder>
 </Solution>
