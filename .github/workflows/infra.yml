@@ -39,10 +39,16 @@ env:
   PARAMETERS_FILE: infra/main.bicepparam
 
 # NOTE: these jobs deliberately have no "environment:" setting.
-# Our Entra ID federated credential trusts tokens whose subject is
-#   repo:<owner>/super-projector:ref:refs/heads/main
-# Adding "environment: dev" changes the subject to
-#   repo:<owner>/super-projector:environment:dev
+# Our Entra ID federated credential trusts tokens whose subject is exactly
+#   repo:<owner>@<owner-id>/<repo>@<repo-id>:ref:refs/heads/main
+# which for this repo is
+#   repo:contact2kuldeep@15072567/super-projector@1450214291:ref:refs/heads/main
+# GitHub includes the immutable numeric owner and repo IDs so that a repo that
+# is renamed, or deleted and recreated with the same name, gets a different
+# subject and cannot reuse our Azure access.
+# If login fails with AADSTS700213, the error message shows the exact subject
+# GitHub sent; copy it into the federated credential.
+# Adding "environment: dev" changes the subject's ending to ":environment:dev",
 # which no longer matches, so Azure login would fail. To use environments
 # later, add a second federated credential for that subject first.
 

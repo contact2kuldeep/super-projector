@@ -138,9 +138,26 @@ waits rather than cancelling one in progress.
 | `AZURE_TENANT_ID` | Directory (tenant) ID |
 | `AZURE_SUBSCRIPTION_ID` | Azure subscription ID |
 
-The app's federated credential trusts the subject
-`repo:<owner>/super-projector:ref:refs/heads/main`, so the jobs deliberately
-have no GitHub `environment:`. Adding one changes the token subject and breaks
-login, unless a matching federated credential is added first. The identity
-also needs a role on the resource group that can create resources (e.g.
-Contributor).
+**Federated credential subject.** Azure only accepts a GitHub token whose
+subject exactly matches the federated credential. GitHub's subject includes
+the immutable numeric IDs of the owner and repo:
+
+```text
+repo:<owner>@<owner-id>/<repo>@<repo-id>:ref:refs/heads/main
+```
+
+For this repo that is:
+
+```text
+repo:contact2kuldeep@15072567/super-projector@1450214291:ref:refs/heads/main
+```
+
+The IDs protect against a repo being renamed, or deleted and recreated with
+the same name: the new repo gets a different ID, so it can't reuse our Azure
+access. If login fails with `AADSTS700213`, the error message shows the exact
+subject GitHub sent; copy it into the federated credential.
+
+The jobs deliberately have no GitHub `environment:`. Adding one changes the
+subject's ending to `:environment:<name>`, which breaks login unless a
+matching federated credential is added first. The identity also needs a role
+on the resource group that can create resources (e.g. Contributor).
