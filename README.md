@@ -127,8 +127,47 @@ manually from the Actions tab (**Run workflow**, on `main`).
    against `rg-superprojector-dev`, then lists the API and web URLs and app
    names in the run's summary.
 
-Only one infra run happens at a time (concurrency group `infra-dev`); a new run
-waits rather than cancelling one in progress.
+### API pipeline (`api.yml`)
+
+Runs when changes to `api/**`, `global.json` or the workflow file are pushed to
+`main`, or manually.
+
+1. **build-test**: installs the .NET SDK from `global.json`, then restores,
+   builds (Release) and runs all unit and integration tests. It then publishes
+   the app and saves it as a build artifact.
+2. **deploy** (only if every test passes): deploys that exact artifact to the
+   Web App with `azure/webapps-deploy`. Then it smoke tests the live app:
+   `/health` must report `Healthy` within about 2 minutes (F1 apps sleep when
+   idle, so the first request is slow), and a sample `POST /api/projection`
+   must return a `projectedBalance`.
+
+### Web pipeline (`web.yml`)
+
+Runs when changes to `web/**` or the workflow file are pushed to `main`, or
+manually. One job:
+
+1. Installs Node 26 (LTS) and dependencies with `npm ci`, then runs lint and tests.
+2. Logs in to Azure and looks up the API's hostname, the Static Web App's
+   name and its deployment token. The token is masked so it never appears in
+   logs.
+3. Builds with `VITE_API_BASE_URL` set to the deployed API, then uploads
+   `web/dist` with `Azure/static-web-apps-deploy` (`skip_app_build: true`, so
+   it deploys the build that was just tested rather than rebuilding).
+4. Checks the site returns HTTP 200.
+
+`web/public/staticwebapp.config.json` is copied into the build. It serves
+`index.html` for unknown paths and adds basic security headers.
+
+### Shared conventions
+
+- Each pipeline lists its URL(s) on the run's **Summary** page.
+- Each has its own concurrency group (`infra-dev`, `api-dev`, `web-dev`): only
+  one run of a pipeline happens at a time, and a new run waits rather than
+  cancelling one in progress.
+- Runners are pinned to `ubuntu-24.04` rather than `ubuntu-latest`, so a GitHub
+  image upgrade can't change the build unexpectedly.
+- Resource names have generated suffixes, so the API and web pipelines look
+  them up with `az` rather than hard-coding them. Run the infra pipeline first.
 
 **Repository secrets required** (these are IDs, not passwords):
 

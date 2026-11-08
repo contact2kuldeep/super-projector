@@ -1,0 +1,174 @@
+# API pipeline: builds, tests and deploys the .NET API to Azure App Service.
+#
+# build-test: restore, build and run every unit and integration test, then
+#             package the app ("publish") as a build artifact.
+# deploy:     upload that exact package to the Web App, then smoke test it.
+#
+# Login uses OIDC, as in infra.yml: no Azure password or key is stored in
+# GitHub. The three AZURE_* secrets are only IDs.
+
+name: api
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'api/**'
+      - 'global.json' # changing the SDK version should rebuild the API
+      - '.github/workflows/api.yml'
+  # Adds a "Run workflow" button on the Actions tab. Choose the main branch.
+  workflow_dispatch:
+
+# 'id-token: write' is needed for the OIDC token; 'contents: read' for checkout.
+permissions:
+  id-token: write
+  contents: read
+
+# One API deployment at a time; a new run waits rather than cancelling.
+concurrency:
+  group: api-dev
+  cancel-in-progress: false
+
+env:
+  RESOURCE_GROUP: rg-superprojector-dev
+  ARTIFACT_NAME: api-package
+
+# NOTE: no "environment:" on these jobs. It would change the OIDC token subject
+# and break Azure login. See the full explanation in infra.yml.
+
+jobs:
+  build-test:
+    runs-on: ubuntu-24.04 # pinned, so a GitHub image upgrade can't change our build unexpectedly
+    # The federated credential only trusts main, so skip cleanly on any other
+    # branch instead of failing at login in the deploy job.
+    if: github.ref == 'refs/heads/main'
+    defaults:
+      run:
+        working-directory: api # every 'run' step below starts in api/
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      # Install the exact .NET SDK pinned in global.json, the same one we use
+      # locally.
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      # Download NuGet packages once; later steps use --no-restore.
+      - name: Restore packages
+        run: dotnet restore
+
+      # Release configuration is the optimised build we ship.
+      - name: Build
+        run: dotnet build --configuration Release --no-restore
+
+      # Runs every test (unit and integration). Any failure fails the job, so
+      # nothing is deployed unless all tests pass.
+      - name: Test
+        run: dotnet test --configuration Release --no-build --verbosity normal
+
+      # Gather the compiled app and everything it needs to run into one folder.
+      - name: Publish
+        run: dotnet publish src/SuperProjector.Api --configuration Release --no-build --output publish
+
+      # Save the folder so the deploy job (on a different machine) can use it.
+      # Deploying this exact build means what we tested is what we ship.
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: api/publish # actions ignore 'working-directory', so give the full path
+          if-no-files-found: error
+
+  deploy:
+    runs-on: ubuntu-24.04 # pinned, so a GitHub image upgrade can't change our build unexpectedly
+    needs: build-test # only runs if every test passed
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: publish
+
+      - name: Log in to Azure (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # The web app name has a generated suffix (see infra/main.bicep), so we
+      # look it up rather than hard-coding it. The resource group holds just
+      # one web app. Values written to $GITHUB_OUTPUT can be read by later
+      # steps as steps.lookup.outputs.<name>.
+      - name: Find the API web app
+        id: lookup
+        run: |
+          app_name=$(az webapp list -g "$RESOURCE_GROUP" --query "[0].name" -o tsv)
+          app_host=$(az webapp list -g "$RESOURCE_GROUP" --query "[0].defaultHostName" -o tsv)
+          if [ -z "$app_name" ]; then
+            echo "::error::No web app found in $RESOURCE_GROUP. Run the infra pipeline first."
+            exit 1
+          fi
+          echo "Found $app_name at $app_host"
+          echo "app_name=$app_name" >> "$GITHUB_OUTPUT"
+          echo "app_url=https://$app_host" >> "$GITHUB_OUTPUT"
+
+      # Zip up the publish folder and deploy it to the web app, then restart it.
+      - name: Deploy to App Service
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ steps.lookup.outputs.app_name }}
+          package: publish
+
+      # Check the deployed app actually works. The F1 tier sleeps when idle, so
+      # the first requests after a deploy can be slow or fail: retry for about
+      # 2 minutes (24 tries x 5 seconds) before giving up.
+      - name: Smoke test /health
+        env:
+          APP_URL: ${{ steps.lookup.outputs.app_url }}
+        run: |
+          for attempt in $(seq 1 24); do
+            status=$(curl --silent --max-time 10 "$APP_URL/health" | jq -r '.status' 2>/dev/null || true)
+            if [ "$status" = "Healthy" ]; then
+              echo "Health check passed on attempt $attempt."
+              exit 0
+            fi
+            echo "Attempt $attempt: got '${status:-no response}', retrying in 5 seconds..."
+            sleep 5
+          done
+          echo "::error::$APP_URL/health did not report Healthy within about 2 minutes."
+          exit 1
+
+      # Call the real endpoint with the sample from the README and check the
+      # response has the field the web app needs. --fail makes curl return an
+      # error on any 4xx/5xx response.
+      - name: Smoke test /api/projection
+        env:
+          APP_URL: ${{ steps.lookup.outputs.app_url }}
+        run: |
+          response=$(curl --silent --show-error --fail --max-time 30 \
+            -X POST "$APP_URL/api/projection" \
+            -H "Content-Type: application/json" \
+            -d '{"age":40,"currentBalance":150000,"annualSalary":110000,"contributionRatePercent":12}')
+          echo "$response"
+          if ! echo "$response" | grep -q '"projectedBalance"'; then
+            echo "::error::Response did not contain projectedBalance."
+            exit 1
+          fi
+
+      - name: Write API URL to job summary
+        env:
+          APP_URL: ${{ steps.lookup.outputs.app_url }}
+        run: |
+          {
+            echo "## API deployed"
+            echo ""
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Web app | ${{ steps.lookup.outputs.app_name }} |"
+            echo "| URL | $APP_URL |"
+            echo "| Health | $APP_URL/health |"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -54,7 +54,7 @@ env:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # pinned, so a GitHub image upgrade can't change our build unexpectedly
     # The federated credential only trusts main, so skip cleanly on any other
     # branch instead of failing at login.
     if: github.ref == 'refs/heads/main'
@@ -85,7 +85,7 @@ jobs:
             --parameters "$PARAMETERS_FILE"
 
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # pinned, so a GitHub image upgrade can't change our build unexpectedly
     # Only runs if validate succeeded.
     needs: validate
     steps:

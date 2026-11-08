@@ -1,0 +1,153 @@
+# Web pipeline: lints, tests, builds and deploys the React app to Azure Static
+# Web Apps.
+#
+# One job: the build needs the API's URL (Vite bakes it into the JavaScript),
+# so we log in to Azure first, look up the URL, then build and deploy.
+#
+# Login uses OIDC, as in infra.yml: no Azure password or key is stored in
+# GitHub. The three AZURE_* secrets are only IDs.
+
+name: web
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'web/**'
+      - '.github/workflows/web.yml'
+  # Adds a "Run workflow" button on the Actions tab. Choose the main branch.
+  workflow_dispatch:
+
+# 'id-token: write' is needed for the OIDC token; 'contents: read' for checkout.
+permissions:
+  id-token: write
+  contents: read
+
+# One web deployment at a time; a new run waits rather than cancelling.
+concurrency:
+  group: web-dev
+  cancel-in-progress: false
+
+env:
+  RESOURCE_GROUP: rg-superprojector-dev
+
+# NOTE: no "environment:" on this job. It would change the OIDC token subject
+# and break Azure login. See the full explanation in infra.yml.
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-24.04 # pinned, so a GitHub image upgrade can't change our build unexpectedly
+    # The federated credential only trusts main, so skip cleanly on any other
+    # branch instead of failing at login.
+    if: github.ref == 'refs/heads/main'
+    defaults:
+      run:
+        working-directory: web # every 'run' step below starts in web/
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      # Node 26 is the current LTS (and what we use locally). The npm cache
+      # makes 'npm ci' faster by reusing packages from earlier runs while
+      # package-lock.json is unchanged.
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # 'npm ci' installs exactly what package-lock.json lists, for repeatable
+      # builds. (Unlike 'npm install', it never changes the lock file.)
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm run test -- --run
+
+      - name: Log in to Azure (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # Resource names have a generated suffix (see infra/main.bicep), so we
+      # look them up. The deployment token is a secret: ::add-mask:: tells
+      # GitHub to replace it with *** anywhere it would appear in the logs.
+      # We mask it before doing anything else with it.
+      - name: Find the API and Static Web App
+        id: lookup
+        run: |
+          api_host=$(az webapp list -g "$RESOURCE_GROUP" --query "[0].defaultHostName" -o tsv)
+          swa_name=$(az staticwebapp list -g "$RESOURCE_GROUP" --query "[0].name" -o tsv)
+          if [ -z "$api_host" ] || [ -z "$swa_name" ]; then
+            echo "::error::API or Static Web App not found in $RESOURCE_GROUP. Run the infra pipeline first."
+            exit 1
+          fi
+          swa_host=$(az staticwebapp show -n "$swa_name" -g "$RESOURCE_GROUP" --query "defaultHostname" -o tsv)
+
+          token=$(az staticwebapp secrets list -n "$swa_name" -g "$RESOURCE_GROUP" --query "properties.apiKey" -o tsv)
+          echo "::add-mask::$token"
+
+          echo "Found API at $api_host and Static Web App $swa_name at $swa_host"
+          echo "api_url=https://$api_host" >> "$GITHUB_OUTPUT"
+          echo "site_url=https://$swa_host" >> "$GITHUB_OUTPUT"
+          # Passed only to the deploy step below, not set as an environment
+          # variable, so other steps never see it.
+          echo "deploy_token=$token" >> "$GITHUB_OUTPUT"
+
+      # Vite reads VITE_API_BASE_URL at build time and bakes it into the
+      # JavaScript, so the browser knows where the API is. The output goes to
+      # web/dist (including staticwebapp.config.json, copied from web/public).
+      - name: Build
+        env:
+          VITE_API_BASE_URL: ${{ steps.lookup.outputs.api_url }}
+        run: npm run build
+
+      # Upload the already-built files. skip_app_build stops the action
+      # running its own build, so it deploys exactly the build we just tested.
+      # Paths here are from the repo root (actions ignore 'working-directory').
+      - name: Deploy to Static Web App
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          action: upload
+          azure_static_web_apps_api_token: ${{ steps.lookup.outputs.deploy_token }}
+          app_location: web/dist
+          api_location: '' # no Azure Functions API; ours runs on App Service
+          skip_app_build: true
+
+      # Check the site is up. New content can take a few seconds to appear,
+      # so retry for about a minute.
+      - name: Smoke test site
+        env:
+          SITE_URL: ${{ steps.lookup.outputs.site_url }}
+        run: |
+          for attempt in $(seq 1 12); do
+            code=$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 10 "$SITE_URL" || true)
+            if [ "$code" = "200" ]; then
+              echo "Site returned 200 on attempt $attempt."
+              exit 0
+            fi
+            echo "Attempt $attempt: got HTTP $code, retrying in 5 seconds..."
+            sleep 5
+          done
+          echo "::error::$SITE_URL did not return HTTP 200."
+          exit 1
+
+      - name: Write site URL to job summary
+        env:
+          SITE_URL: ${{ steps.lookup.outputs.site_url }}
+          API_URL: ${{ steps.lookup.outputs.api_url }}
+        run: |
+          {
+            echo "## Web app deployed"
+            echo ""
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Site | $SITE_URL |"
+            echo "| Calls API at | $API_URL |"
+          } >> "$GITHUB_STEP_SUMMARY"
