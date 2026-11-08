@@ -62,3 +62,49 @@ to anyone using the site. Never put secrets in a `VITE_` variable.
 
 The API only accepts browser requests from the origins listed in its
 `Cors:AllowedOrigins` setting, so the web app's URL must be listed there too.
+
+## Infrastructure
+
+All Azure resources are defined in Bicep in `infra/`; never change them by
+hand in the portal.
+
+- `infra/main.bicep`: the template. It creates a Log Analytics workspace,
+  workspace-based Application Insights, a Free-tier Static Web App (web), a
+  Linux App Service Plan and a Web App running .NET 10 (API). Every resource is
+  tagged `project=super-projector`, `env=<environment>`, `managedBy=bicep`.
+- `infra/main.bicepparam`: parameter values for the `dev` environment.
+
+Resource names end in a short suffix generated from the resource group ID, so
+they are unique across Azure and stay the same on every deployment.
+
+The resource group `rg-superprojector-dev` (australiaeast) must already exist.
+From the repo root, check and preview the template:
+
+```sh
+az bicep build --file infra/main.bicep        # compile and check for errors
+az deployment group what-if \
+  --resource-group rg-superprojector-dev \
+  --parameters infra/main.bicepparam          # preview changes; deploys nothing
+```
+
+Useful parameters (override with `--parameters name=value`):
+
+| Parameter | Default | Notes |
+| --- | --- | --- |
+| `location` | resource group's region | Region for the API and monitoring. |
+| `appServiceSkuName` | `F1` (free) | Use `B1` if F1 is unavailable. |
+| `staticWebAppLocation` | `eastasia` | Static Web Apps only run in a few regions; content is still served globally. |
+
+### Known constraints
+
+- **API and monitoring are in australiasoutheast (Melbourne), not
+  australiaeast.** Our new subscription has 0 F1 App Service quota in
+  australiaeast, so deployments fail there with `SubscriptionIsOverQuotaForSku`.
+  `main.bicepparam` sets `location = 'australiasoutheast'` for dev, which still
+  keeps data onshore in Australia. The resource group itself stays in
+  australiaeast; that only affects where its metadata is stored.
+- **The Static Web App is in eastasia.** Static Web Apps supports only a few
+  regions, none of them in Australia. Its content is still served from a
+  global CDN, and it hosts static files only (HTML, JavaScript, CSS) with no
+  member data. Member inputs go straight from the browser to the API in
+  Australia.
