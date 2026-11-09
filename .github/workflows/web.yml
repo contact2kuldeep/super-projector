@@ -15,6 +15,10 @@ on:
     paths:
       - 'web/**'
       - '.github/workflows/web.yml'
+      # Docs-only changes don't deploy. GitHub doesn't allow 'paths' and
+      # 'paths-ignore' together, so we exclude with '!'. It must come last,
+      # because later patterns override earlier ones.
+      - '!**/*.md'
   # Adds a "Run workflow" button on the Actions tab. Choose the main branch.
   workflow_dispatch:
 
